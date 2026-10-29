@@ -3,13 +3,30 @@ Retro Lens - Real-time Hand Gesture Filter Pipeline
 """
 
 from dataclasses import dataclass
+import os
 import random
 import time
 from typing import Dict, List, Tuple, Callable
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python import vision as mp_vision
 import numpy as np
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "hand_landmarker.task")
+
+# Filter yang mahal di resolusi penuh; diproses di resolusi lebih kecil lalu di-upscale.
+HEAVY_FILTERS = {"cartoon", "sketch", "rainbow_wave"}
 
 
 @dataclass
@@ -17,6 +34,8 @@ class PipelineConfig:
     cam_index: int = 0
     frame_width: int = 960
     frame_height: int = 540
+    detection_max_width: int = 640
+    filter_max_dim: int = 640
     pinch_threshold_px: float = 45.0
     filter_cooldown_sec: float = 0.15
     mode_cooldown_sec: float = 1.2
@@ -165,15 +184,25 @@ class PortalProcessor:
         self.last_switch_time = 0.0
         self.last_mode_toggle = 0.0
 
-        self.mp_hands = mp.solutions.hands
-        self.mp_draw = mp.solutions.drawing_utils
-        self.detector = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            model_complexity=1,
-            min_detection_confidence=0.8,
+        if not os.path.exists(MODEL_PATH):
+            raise FileNotFoundError(
+                f"[ERROR] Model tidak ditemukan: {MODEL_PATH}\n"
+                "Download dulu: models/hand_landmarker.task (lihat README)."
+            )
+        options = mp_vision.HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=MODEL_PATH),
+            running_mode=mp_vision.RunningMode.VIDEO,
+            num_hands=2,
+            min_hand_detection_confidence=0.8,
+            min_hand_presence_confidence=0.8,
             min_tracking_confidence=0.8,
         )
+        self.detector = mp_vision.HandLandmarker.create_from_options(options)
+        self._last_ts_ms = -1
+        self._fps = 0.0
+        self._prev_frame_time = 0.0
+        self._detect_buf = None
+        self._canvas = None
 
     @property
     def current_filter_name(self) -> str:
@@ -196,7 +225,15 @@ class PortalProcessor:
             return frame
 
         roi = frame[y : y + h, x : x + w].copy()
-        processed_roi = self.filters[filter_key](roi)
+        if filter_key in HEAVY_FILTERS and self.cfg.filter_max_dim and max(w, h) > self.cfg.filter_max_dim:
+            scale = self.cfg.filter_max_dim / max(w, h)
+            small_w = max(1, int(round(w * scale)))
+            small_h = max(1, int(round(h * scale)))
+            small = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_AREA)
+            processed_roi = self.filters[filter_key](small)
+            processed_roi = cv2.resize(processed_roi, (w, h), interpolation=cv2.INTER_LINEAR)
+        else:
+            processed_roi = self.filters[filter_key](roi)
 
         mask = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(mask, [poly - [x, y]], 255)
@@ -209,23 +246,68 @@ class PortalProcessor:
         cv2.polylines(frame, [poly], isClosed=True, color=(255, 255, 255), thickness=2)
         return frame
 
+    def _fit_frame(self, frame: np.ndarray) -> np.ndarray:
+        target_w, target_h = self.cfg.frame_width, self.cfg.frame_height
+        h, w = frame.shape[:2]
+        if (w, h) == (target_w, target_h):
+            return frame
+
+        scale = min(target_w / w, target_h / h)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+
+        if (
+            self._canvas is None
+            or self._canvas.shape != (target_h, target_w, frame.shape[2])
+            or self._canvas.dtype != frame.dtype
+        ):
+            self._canvas = np.zeros((target_h, target_w, frame.shape[2]), dtype=frame.dtype)
+        else:
+            self._canvas.fill(0)
+
+        x_off = (target_w - new_w) // 2
+        y_off = (target_h - new_h) // 2
+        self._canvas[y_off : y_off + new_h, x_off : x_off + new_w] = resized
+        return self._canvas
+
+    def _detection_frame(self, frame: np.ndarray) -> np.ndarray:
+        h, w = frame.shape[:2]
+        target_w = min(w, self.cfg.detection_max_width)
+        if target_w >= w:
+            return frame
+
+        target_h = max(1, int(round(h * target_w / w)))
+        if self._detect_buf is None or self._detect_buf.shape[:2] != (target_h, target_w):
+            self._detect_buf = np.empty((target_h, target_w, frame.shape[2]), dtype=frame.dtype)
+        return cv2.resize(frame, (target_w, target_h), dst=self._detect_buf, interpolation=cv2.INTER_AREA)
+
     def process_frame(self, frame: np.ndarray) -> np.ndarray:
         frame = cv2.flip(frame, 1)
-        frame = cv2.resize(frame, (self.cfg.frame_width, self.cfg.frame_height))
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        results = self.detector.process(rgb)
+        frame = self._fit_frame(frame)
+        detect_frame = self._detection_frame(frame)
+        rgb = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2RGB)
         now = time.time()
-        
+
+        if self._prev_frame_time:
+            instant_fps = 1.0 / max(now - self._prev_frame_time, 1e-6)
+            self._fps = instant_fps if self._fps == 0.0 else (self._fps * 0.9 + instant_fps * 0.1)
+        self._prev_frame_time = now
+
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        ts_ms = max(int(now * 1000), self._last_ts_ms + 1)
+        self._last_ts_ms = ts_ms
+        results = self.detector.detect_for_video(mp_image, ts_ms)
+
         all_hand_tips = []
         fist_count = 0
         is_bowtie = False
 
-        if results.multi_hand_landmarks:
-            for hand_lm in results.multi_hand_landmarks:
-                self.mp_draw.draw_landmarks(frame, hand_lm, self.mp_hands.HAND_CONNECTIONS)
-                
-                lm = hand_lm.landmark
+        if results.hand_landmarks:
+            for lm in results.hand_landmarks:
+                self._draw_hand(frame, lm)
+
                 tips = [(int(lm[i].x * self.cfg.frame_width), int(lm[i].y * self.cfg.frame_height)) for i in [4, 8, 12, 16, 20]]
                 all_hand_tips.append(tips)
 
@@ -266,20 +348,45 @@ class PortalProcessor:
         self._draw_hud(frame, is_bowtie)
         return frame
 
+    def _draw_hand(self, frame: np.ndarray, lm) -> None:
+        w, h = self.cfg.frame_width, self.cfg.frame_height
+        pts = [(int(p.x * w), int(p.y * h)) for p in lm]
+        for a, b in HAND_CONNECTIONS:
+            cv2.line(frame, pts[a], pts[b], (200, 200, 200), 1)
+        for p in pts:
+            cv2.circle(frame, p, 3, (0, 255, 0), -1)
+
     def _draw_hud(self, frame: np.ndarray, is_bowtie: bool) -> None:
         mode_str = "3D Mesh" if self.is_3d_mode else ("2D Bowtie" if is_bowtie else "2D Quad")
         cv2.putText(frame, f"MODE: {mode_str} [Key 'C' / Dual Fist]", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
         cv2.putText(frame, f"FILTER: {self.current_filter_name.upper()} [Pinch / Key 'N'/'P']", (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+        fps_text = f"FPS: {self._fps:4.1f}"
+        (tw, _), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        x = max(15, frame.shape[1] - tw - 15)
+        cv2.putText(frame, fps_text, (x, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
 
 def main() -> None:
     cfg = PipelineConfig()
     processor = PortalProcessor(cfg)
     cap = cv2.VideoCapture(cfg.cam_index)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.frame_width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.frame_height)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     if not cap.isOpened():
         print("[ERROR] Kamera tidak terdeteksi!")
         return
+
+    cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cam_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"[INFO] Kamera: {cam_w}x{cam_h} @ {cam_fps:.0f} FPS -> output {cfg.frame_width}x{cfg.frame_height} (aspect ratio dijaga)")
+    if cam_fps and cam_fps < 25:
+        print("[WARN] Kamera melaporkan FPS rendah (<25). Coba mode MJPG / turunkan resolusi kamera / perbaiki pencahayaan.")
 
     while True:
         ret, frame = cap.read()

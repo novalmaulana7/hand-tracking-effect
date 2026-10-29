@@ -1,3 +1,3 @@
 opencv-python
-mediapipe
+mediapipe<1
 numpy
